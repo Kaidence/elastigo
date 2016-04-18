@@ -92,13 +92,20 @@ type BulkIndexer struct {
 	mu sync.Mutex
 	// Wait Group for the http sends
 	sendWg *sync.WaitGroup
+	// Stats channel reporting on timings of requests to ElasticSearch
+	StatsCh chan *BulkIndexStats
+}
+
+type BulkIndexStats struct {
+	NumErrors int
+	Duration  time.Duration
 }
 
 func (b *BulkIndexer) NumErrors() uint64 {
 	return b.numErrors
 }
 
-func (c *Conn) NewBulkIndexer(maxConns int) *BulkIndexer {
+func (c *Conn) NewBulkIndexer(maxConns int, reportStats bool) *BulkIndexer {
 	b := BulkIndexer{conn: c, sendBuf: make(chan *bytes.Buffer, maxConns)}
 	b.needsTimeBasedFlush = true
 	b.buf = new(bytes.Buffer)
@@ -111,6 +118,9 @@ func (c *Conn) NewBulkIndexer(maxConns int) *BulkIndexer {
 	b.docDoneChan = make(chan bool)
 	b.timerDoneChan = make(chan bool)
 	b.httpDoneChan = make(chan bool)
+	if reportStats {
+		b.StatsCh = make(chan *BulkIndexStats, 100) // Limit stats we send for proof of concept
+	}
 	return &b
 }
 
@@ -121,7 +131,7 @@ func (c *Conn) NewBulkIndexer(maxConns int) *BulkIndexer {
 //   done := make(chan bool)
 //   BulkIndexerGlobalRun(100, done)
 func (c *Conn) NewBulkIndexerErrors(maxConns, retrySeconds int) *BulkIndexer {
-	b := c.NewBulkIndexer(maxConns)
+	b := c.NewBulkIndexer(maxConns, false)
 	b.RetryForSeconds = retrySeconds
 	b.ErrorChannel = make(chan *ErrorBuffer, 20)
 	return b
@@ -347,14 +357,18 @@ func (b *BulkIndexer) UpdateWithPartialDoc(index string, _type string, id, ttl s
 // This does the actual send of a buffer, which has already been formatted
 // into bytes of ES formatted bulk data
 func (b *BulkIndexer) Send(buf *bytes.Buffer) error {
+	var err error
 	type responseStruct struct {
 		Took   int64                    `json:"took"`
 		Errors bool                     `json:"errors"`
 		Items  []map[string]interface{} `json:"items"`
 	}
 
+	numErrors := 0
+
 	response := responseStruct{}
 
+	start := time.Now()
 	body, err := b.conn.DoCommand("POST", "/_bulk", nil, buf)
 
 	if err != nil {
@@ -365,10 +379,12 @@ func (b *BulkIndexer) Send(buf *bytes.Buffer) error {
 	jsonErr := json.Unmarshal(body, &response)
 	if jsonErr == nil {
 		if response.Errors {
+			numErrors = len(response.Items)
 			b.numErrors += uint64(len(response.Items))
-			return fmt.Errorf("Bulk Insertion Error. Failed item count [%d]", len(response.Items))
+			err = fmt.Errorf("Bulk Insertion Error. Failed item count [%d]", len(response.Items))
 		}
 	}
+	b.StatsCh <- &BulkIndexStats{NumErrors: numErrors, Duration: time.Now().Sub(start)}
 	return nil
 }
 
