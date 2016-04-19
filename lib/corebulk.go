@@ -384,7 +384,10 @@ func (b *BulkIndexer) Send(buf *bytes.Buffer) error {
 			err = fmt.Errorf("Bulk Insertion Error. Failed item count [%d]", len(response.Items))
 		}
 	}
-	b.StatsCh <- &BulkIndexStats{NumErrors: numErrors, Duration: time.Now().Sub(start)}
+	select {
+	case b.StatsCh <- &BulkIndexStats{NumErrors: numErrors, Duration: time.Now().Sub(start)}:
+	default:
+	}
 	return nil
 }
 
